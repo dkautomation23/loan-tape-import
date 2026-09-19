@@ -1,5 +1,7 @@
 # Идемпотентный импорт кредитного реестра с аудитом
 
+[![tests](https://github.com/dkautomation23/loan-tape-import/actions/workflows/ci.yml/badge.svg)](https://github.com/dkautomation23/loan-tape-import/actions/workflows/ci.yml)
+
 Типовая задача кредитного сервисинга: приём выгрузки кредитов
 (loan tape), которую кредитор присылает снова и снова — иногда тот же файл,
 иногда те же данные в другом порядке, иногда с исправленным полем.

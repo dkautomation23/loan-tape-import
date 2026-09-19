@@ -1,9 +1,9 @@
--- Идемпотентный импорт кредитного реестра (loan tape) с аудитом.
--- Пишется под Postgres; для мгновенного прогона совместимо с SQLite.
--- Различия, где они есть, отмечены комментарием POSTGRES.
+-- Idempotent loan tape import with an audit trail.
+-- Targets Postgres; runs unchanged on SQLite so the tests need no server.
+-- Where the two differ, the Postgres form is noted with a POSTGRES comment.
 
 -- ---------------------------------------------------------------------------
--- Арендаторы. Всё изолируется по lender_id, включая уникальные ключи.
+-- Tenants. Everything is isolated by lender_id, including the unique keys.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS lenders (
     lender_id   INTEGER PRIMARY KEY,
@@ -13,9 +13,9 @@ CREATE TABLE IF NOT EXISTS lenders (
 );
 
 -- ---------------------------------------------------------------------------
--- Партия импорта. Одна строка на загруженный файл.
--- file_sha256 позволяет отличить «тот же самый файл» от «файла с теми же
--- данными»: первый случай — no-op целиком, и это самая дешёвая проверка.
+-- One import batch per uploaded file.
+-- file_sha256 separates "the same file" from "a file with the same data":
+-- the first case is a whole-batch no-op, and it is the cheapest check there is.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS import_batches (
     batch_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,9 +33,9 @@ CREATE TABLE IF NOT EXISTS import_batches (
 );
 
 -- ---------------------------------------------------------------------------
--- Кредиты. Бизнес-ключ — (lender_id, loan_number): так их называет кредитор,
--- и именно по нему строка «та же самая» при повторной выгрузке.
--- row_sha256 — хэш значимых полей, отвечает на вопрос «изменилось ли что-то».
+-- Loans. The business key is (lender_id, loan_number): that is what the lender
+-- calls the loan, and it is what makes a row "the same row" on a re-export.
+-- row_sha256 hashes the significant fields and answers "did anything change".
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS loans (
     loan_id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,8 +54,8 @@ CREATE TABLE IF NOT EXISTS loans (
 );
 
 -- ---------------------------------------------------------------------------
--- Журнал событий, только добавление. Ничего не обновляется и не удаляется:
--- это то, что показывают аудитору, и то, из чего строится лента активности.
+-- Append-only event log. Nothing here is updated or deleted: this is what an
+-- auditor is shown, and what the activity feed is built from.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS events (
     event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,9 +72,9 @@ CREATE INDEX IF NOT EXISTS idx_events_loan   ON events (lender_id, loan_id, even
 CREATE INDEX IF NOT EXISTS idx_events_batch  ON events (batch_id, event_id);
 
 -- ---------------------------------------------------------------------------
--- Карантин. Строка, которую не удалось разобрать, НЕ теряется и НЕ ломает
--- импорт: она откладывается с причиной. Импорт, падающий на 4000-й строке из
--- 5000, оставляет данные в половинном состоянии — это худший исход из всех.
+-- Quarantine. A row that will not parse is NOT lost and does NOT break the
+-- import: it is held with a reason. An import that dies on row 4000 of 5000
+-- leaves the data half-loaded, which is the worst outcome available.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS quarantined_rows (
     quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,9 +87,9 @@ CREATE TABLE IF NOT EXISTS quarantined_rows (
 );
 
 -- ---------------------------------------------------------------------------
--- История значений. Каждое изменившееся поле пишется отдельной строкой:
--- «в партии 7 ставка по кредиту 10041 стала 8.99 вместо 9.49».
--- Именно это спрашивает аудитор, и именно это неудобно доставать из jsonb.
+-- Field history. Every changed field gets its own row: "in batch 7 the rate on
+-- loan 10041 became 8.99 instead of 9.49". That is exactly what an auditor asks
+-- for, and exactly what is awkward to dig back out of jsonb.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS loan_field_history (
     history_id  INTEGER PRIMARY KEY AUTOINCREMENT,

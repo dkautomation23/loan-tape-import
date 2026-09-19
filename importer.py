@@ -1,28 +1,25 @@
 # -*- coding: utf-8 -*-
-"""Идемпотентный импорт кредитного реестра с аудитом.
+"""Idempotent loan tape import with an audit trail.
 
-Задача, которую это решает: кредитор выгружает файл со списком кредитов и
-присылает его снова — завтра, через неделю, иногда дважды за день, иногда с
-исправленным полем, иногда с теми же данными и другим порядком строк.
-Импорт обязан быть безопасным при любом числе повторов.
+The problem: a lender exports a file of loans and sends it again - tomorrow, next
+week, sometimes twice in one day, sometimes with a field corrected, sometimes the
+same data in a different row order. The import has to be safe on every repeat.
 
-Три уровня проверки, от самого дешёвого к самому дорогому:
+Three levels of detection, cheapest first:
 
-  1. Хэш файла. Тот же байт-в-байт файл — партия не создаётся вовсе.
-  2. Хэш строки. Кредит есть, значимые поля не изменились — запись не трогаем,
-     обновляем только отметку «видели в партии N».
-  3. Сравнение по полям. Что-то изменилось — обновляем, пишем событие
-     loan.corrected и по строке в историю на каждое изменившееся поле.
+  1. File hash. The same file byte for byte - no batch is created at all.
+  2. Row hash. The loan exists and no significant field changed - the record is
+     left alone, only the "seen in batch N" marker moves.
+  3. Field comparison. Something changed - update, write a loan.corrected event,
+     and record one history row per changed field.
 
-Проектное решение, которое стоит обсуждать отдельно: при повторной выгрузке с
-исправленным полем мы НЕ делаем no-op, а записываем correction event и
-перезаписываем значение. Альтернатива — считать первую выгрузку истиной и
-игнорировать расхождения — проще, но означает, что исправленная кредитором
-ставка никогда не доедет до системы. Для реестра, по которому ведут взыскание,
-это хуже, чем лишняя запись в журнале.
+The design decision worth arguing about: on a re-export with a corrected field we
+do NOT no-op. We record a correction and overwrite. Treating the first export as
+truth is simpler, but it means a rate the lender fixed never reaches the system.
+For a book that collections are run against, a silently stale value is worse than
+an extra row in the log.
 
-Запуск:
-    py importer.py demo          — создать БД, прогнать три сценария, показать журнал
+    py importer.py demo
     py importer.py import <lender_id> <file.csv>
 """
 import csv
@@ -32,14 +29,14 @@ import json
 import os
 import sqlite3
 
-# Библиотека намеренно не трогает sys.stdout: вызывающий код сам решает,
-# как выводить. Обёртка здесь ломала бы тесты, которые ставят свою.
+# This module deliberately leaves sys.stdout alone: the caller decides how to
+# print. A wrapper here would break tests that install their own.
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "loan_tape.db")
 
-# Поля, изменение которых считается изменением кредита.
-# Порядок фиксирован: он участвует в хэше строки.
+# Fields whose change counts as a change to the loan.
+# The order is fixed because it goes into the row hash.
 SIGNIFICANT = ["borrower_name", "principal", "rate", "maturity_date", "status"]
 REQUIRED = ["loan_number"]
 
@@ -49,8 +46,8 @@ def sha256_text(s: str) -> str:
 
 
 def row_hash(row: dict) -> str:
-    """Хэш значимых полей. Пробелы по краям срезаны, порядок фиксирован,
-    поэтому перестановка колонок в файле не считается изменением данных."""
+    """Hash over the significant fields. Values are trimmed and the order is
+    fixed, so reordering columns in the file is not a data change."""
     parts = [f"{f}={(row.get(f) or '').strip()}" for f in SIGNIFICANT]
     return sha256_text("\x1f".join(parts))
 
@@ -76,36 +73,36 @@ def log_event(conn, lender_id, event_type, payload, loan_id=None, batch_id=None)
 
 
 def validate(row: dict, line_no: int):
-    """Возвращает причину карантина или None. Правило: строка либо
-    полностью пригодна, либо откладывается целиком — частично импортированный
-    кредит хуже отсутствующего, потому что выглядит настоящим."""
+    """Returns a quarantine reason or None. The rule: a row is either fully
+    usable or held whole - a partially imported loan is worse than a missing
+    one, because it looks real."""
     for f in REQUIRED:
         if not (row.get(f) or "").strip():
-            return f"обязательное поле {f} пустое"
+            return f"required field {f} is empty"
     principal = (row.get("principal") or "").strip()
     if principal:
         try:
             if float(principal.replace(",", "")) < 0:
-                return "principal отрицательный"
+                return "principal is negative"
         except ValueError:
-            return f"principal не число: {principal!r}"
+            return f"principal is not a number: {principal!r}"
     rate = (row.get("rate") or "").strip()
     if rate:
         try:
             r = float(rate.replace("%", ""))
             if not 0 <= r <= 100:
-                return f"rate вне диапазона 0..100: {rate!r}"
+                return f"rate outside 0..100: {rate!r}"
         except ValueError:
-            return f"rate не число: {rate!r}"
+            return f"rate is not a number: {rate!r}"
     md = (row.get("maturity_date") or "").strip()
     if md and not (len(md) == 10 and md[4] == "-" and md[7] == "-"):
-        return f"maturity_date не в формате YYYY-MM-DD: {md!r}"
+        return f"maturity_date is not YYYY-MM-DD: {md!r}"
     return None
 
 
 def import_file(conn, lender_id: int, path: str, verbose=True):
-    """Возвращает словарь со счётчиками. Повторный вызов на том же файле
-    безопасен и ничего не меняет."""
+    """Returns a dict of counters. Calling it again on the same file is safe
+    and changes nothing."""
     raw = open(path, "rb").read()
     file_hash = hashlib.sha256(raw).hexdigest()
     filename = os.path.basename(path)
@@ -115,7 +112,7 @@ def import_file(conn, lender_id: int, path: str, verbose=True):
         "WHERE lender_id=? AND file_sha256=?", (lender_id, file_hash)).fetchone()
     if prev and prev["finished_at"]:
         if verbose:
-            print(f"  файл уже импортирован партией {prev['batch_id']} — ничего не делаем")
+            print(f"  file already imported as batch {prev['batch_id']} - nothing to do")
         return {"skipped_identical_file": True, "batch_id": prev["batch_id"],
                 "inserted": 0, "updated": 0, "unchanged": 0, "quarantined": 0}
 
@@ -148,7 +145,7 @@ def import_file(conn, lender_id: int, path: str, verbose=True):
         loan_number = row["loan_number"].strip()
         rhash = row_hash(row)
 
-        # дубль внутри одного файла: последняя строка выигрывает, факт фиксируется
+        # duplicate inside one file: the last row wins, the fact is recorded
         if loan_number in seen_in_file:
             stats["duplicates_in_file"] += 1
             log_event(conn, lender_id, "row.duplicate_in_file",
@@ -215,14 +212,14 @@ def import_file(conn, lender_id: int, path: str, verbose=True):
     conn.commit()
     stats["batch_id"] = batch_id
     if verbose:
-        print(f"  партия {batch_id}: создано {stats['inserted']}, исправлено {stats['updated']},"
-              f" без изменений {stats['unchanged']}, в карантине {stats['quarantined']}")
+        print(f"  batch {batch_id}: created {stats['inserted']}, corrected {stats['updated']},"
+              f" unchanged {stats['unchanged']}, quarantined {stats['quarantined']}")
     return stats
 
 
 def case_activity(conn, lender_id: int, loan_number: str):
-    """Лента активности по одному кредиту — то, что видно на экране дела.
-    Строится ИЗ ЖУРНАЛА, а не из текущего состояния записи."""
+    """Activity feed for one loan - what the case screen shows.
+    Built FROM THE EVENT LOG, not from the current state of the record."""
     loan = conn.execute("SELECT * FROM loans WHERE lender_id=? AND loan_number=?",
                         (lender_id, loan_number)).fetchone()
     if not loan:

@@ -3,4 +3,7 @@ __pycache__/
 *.db
 .venv/
 
-ПУБЛИКАЦИЯ.md
+# Working notes stay local, whatever they are called. README is the only
+# markdown this repository publishes.
+*.md
+!README.md
